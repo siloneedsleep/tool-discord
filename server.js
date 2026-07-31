@@ -1,110 +1,259 @@
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
+const session = require('express-session');
+const passport = require('passport');
+const DiscordStrategy = require('passport-discord').Strategy;
 const { Client } = require('discord.js-selfbot-v13');
 const axios = require('axios');
+const bcrypt = require('bcryptjs');
+const fs = require('fs');
+const path = require('path');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-app.use(express.json());
-app.use(express.static('public'));
-
-// ---------------- Maps & Config ----------------
-const clients = new Map();           // token -> Discord Client
-const socketClients = new Map();     // token -> Set<WebSocket>
-const voiceSettings = new Map();     // token -> { channelId, selfMute, selfDeaf, reconnectTimeout }
-const questQueues = new Map();       // token -> { abort: false, running: Promise }
-
+// ---------------- Cấu hình ----------------
 const PORT = process.env.PORT || 3000;
 const KEEP_ALIVE_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+const SESSION_SECRET = process.env.SESSION_SECRET || uuidv4();
+const DATA_DIR = path.join(__dirname, 'data');
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
 
-// ---------------- Keep-alive (chống sleep Render free) ----------------
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+function readUsers() {
+  try {
+    if (fs.existsSync(USERS_FILE)) {
+      return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+    }
+  } catch (e) { console.error('Read users error:', e); }
+  return {};
+}
+
+function saveUsers(users) {
+  try {
+    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+  } catch (e) { console.error('Save users error:', e); }
+}
+
+// ---------------- Express middleware ----------------
+app.use(express.json());
+app.use(express.static('public'));
+app.use(session({
+  secret: SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: { secure: false, maxAge: 7 * 24 * 60 * 60 * 1000 }
+}));
+app.use(passport.initialize());
+app.use(passport.session());
+
+// ---------------- Passport Discord ----------------
+passport.use(new DiscordStrategy({
+  clientID: process.env.DISCORD_CLIENT_ID,
+  clientSecret: process.env.DISCORD_CLIENT_SECRET,
+  callbackURL: process.env.DISCORD_CALLBACK_URL || `${KEEP_ALIVE_URL}/auth/discord/callback`,
+  scope: ['identify']
+}, (accessToken, refreshToken, profile, done) => {
+  process.nextTick(() => {
+    return done(null, {
+      id: profile.id,
+      username: profile.username,
+      avatar: profile.avatar,
+      discriminator: profile.discriminator,
+      accessToken: accessToken
+    });
+  });
+}));
+
+passport.serializeUser((user, done) => done(null, user.id));
+passport.deserializeUser((id, done) => {
+  const users = readUsers();
+  const user = Object.values(users).find(u => u.discordId === id);
+  done(null, user || { id });
+});
+
+// ---------------- Maps cho selfbot ----------------
+const clients = new Map();
+const socketClients = new Map();
+const voiceSettings = new Map();
+const questQueues = new Map();
+
+// ---------------- Keep-alive chống sleep Render ----------------
 setInterval(() => {
   axios.get(`${KEEP_ALIVE_URL}/ping`).catch(() => {});
 }, 14 * 60 * 1000);
 
-// ---------------- Helper Functions ----------------
+// ---------------- Helpers ----------------
 function broadcastToToken(token, data) {
   const sockets = socketClients.get(token);
   if (sockets) {
-    const message = JSON.stringify(data);
-    sockets.forEach(ws => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(message);
-    });
+    const msg = JSON.stringify(data);
+    sockets.forEach(ws => { if (ws.readyState === WebSocket.OPEN) ws.send(msg); });
   }
 }
 
 function cleanupClient(token) {
   const client = clients.get(token);
-  if (client) {
-    try { client.destroy(); } catch(e) {}
-    clients.delete(token);
-  }
-  // Clear voice reconnect
-  const voice = voiceSettings.get(token);
-  if (voice && voice.reconnectTimeout) clearTimeout(voice.reconnectTimeout);
+  if (client) { try { client.destroy(); } catch(e) {} clients.delete(token); }
+  const vs = voiceSettings.get(token);
+  if (vs?.reconnectTimeout) clearTimeout(vs.reconnectTimeout);
   voiceSettings.delete(token);
-  // Abort quest queue
-  const queue = questQueues.get(token);
-  if (queue) queue.abort = true;
+  const q = questQueues.get(token);
+  if (q) q.abort = true;
   questQueues.delete(token);
 }
 
-// ---------------- Voice Reconnect Logic ----------------
 async function joinVoiceChannel(client, token, channelId, selfMute, selfDeaf) {
   try {
     if (!client.voice) return;
     await client.voice.join(channelId, { selfMute, selfDeaf });
     voiceSettings.set(token, { channelId, selfMute, selfDeaf, reconnectTimeout: null });
-    console.log(`[Voice] ${client.user.tag} joined ${channelId}`);
-  } catch (err) {
-    console.error(`[Voice] Join error:`, err.message);
-  }
+  } catch (err) { console.error('Voice join error:', err.message); }
 }
 
 function setupClientEvents(client, token) {
   client.on('ready', async () => {
-    console.log(`[Client] ${client.user.tag} ready`);
-    // Auto-rejoin voice if configured
     const vs = voiceSettings.get(token);
-    if (vs && vs.channelId && client.voice && !client.voice.channelId) {
+    if (vs?.channelId && client.voice && !client.voice.channelId) {
       await joinVoiceChannel(client, token, vs.channelId, vs.selfMute, vs.selfDeaf);
     }
   });
 
   client.on('voiceStateUpdate', (oldState, newState) => {
     const vs = voiceSettings.get(token);
-    if (!vs || !vs.channelId) return;
-    // If we were in our target channel and now we are disconnected
+    if (!vs?.channelId) return;
     if (oldState.channelId && !newState.channelId && oldState.channelId === vs.channelId) {
-      console.log(`[Voice] Disconnected, scheduling reconnect in 5s`);
       if (vs.reconnectTimeout) clearTimeout(vs.reconnectTimeout);
-      vs.reconnectTimeout = setTimeout(async () => {
+      vs.reconnectTimeout = setTimeout(() => {
         if (clients.has(token) && voiceSettings.get(token)?.channelId === vs.channelId) {
-          await joinVoiceChannel(client, token, vs.channelId, vs.selfMute, vs.selfDeaf);
+          joinVoiceChannel(client, token, vs.channelId, vs.selfMute, vs.selfDeaf);
         }
       }, 5000);
     }
   });
 
-  client.on('error', (err) => {
-    console.error(`[Client] ${token.slice(0, 10)}... Error:`, err.message);
-  });
+  client.on('error', (err) => console.error('Client error:', err.message));
 }
 
-// ---------------- API Routes ----------------
+// ---------------- Middleware kiểm tra đăng nhập + PIN ----------------
+function isAuthenticated(req, res, next) {
+  if (req.isAuthenticated() && req.user?.pinVerified) return next();
+  res.redirect('/');
+}
+
+// ---------------- Auth routes ----------------
+app.get('/auth/discord', passport.authenticate('discord'));
+
+app.get('/auth/discord/callback',
+  passport.authenticate('discord', { failureRedirect: '/' }),
+  (req, res) => {
+    const discordId = req.user.id;
+    const users = readUsers();
+    if (users[discordId]) {
+      res.redirect(`/?needPin=true&discordId=${discordId}`);
+    } else {
+      res.redirect(`/?createPin=true&discordId=${discordId}&username=${req.user.username}&avatar=${req.user.avatar}`);
+    }
+  }
+);
+
+app.post('/api/auth/create-pin', (req, res) => {
+  const { discordId, pin, username, avatar } = req.body;
+  if (!pin || !/^\d{8}$/.test(pin)) {
+    return res.status(400).json({ error: 'PIN phải là 8 chữ số' });
+  }
+  const users = readUsers();
+  users[discordId] = {
+    discordId,
+    username,
+    avatar,
+    pin: bcrypt.hashSync(pin, 10),
+    token: null,
+    createdAt: new Date().toISOString()
+  };
+  saveUsers(users);
+  req.login({ ...req.user, pinVerified: true, discordId }, (err) => {
+    if (err) return res.status(500).json({ error: 'Login failed' });
+    res.json({ success: true, redirect: '/dashboard' });
+  });
+});
+
+app.post('/api/auth/verify-pin', (req, res) => {
+  const { discordId, pin } = req.body;
+  if (!discordId || !pin) return res.status(400).json({ error: 'Thiếu thông tin' });
+  const users = readUsers();
+  const user = users[discordId];
+  if (!user) return res.status(404).json({ error: 'Tài khoản không tồn tại' });
+  if (!bcrypt.compareSync(pin, user.pin)) {
+    return res.status(401).json({ error: 'PIN không đúng' });
+  }
+  req.login({ ...req.user, pinVerified: true, discordId }, (err) => {
+    if (err) return res.status(500).json({ error: 'Login failed' });
+    res.json({ success: true, redirect: '/dashboard' });
+  });
+});
+
+app.post('/api/auth/change-pin', isAuthenticated, (req, res) => {
+  const { oldPin, newPin } = req.body;
+  const discordId = req.user.discordId;
+  const users = readUsers();
+  const user = users[discordId];
+  if (!bcrypt.compareSync(oldPin, user.pin)) {
+    return res.status(401).json({ error: 'PIN cũ không đúng' });
+  }
+  if (!/^\d{8}$/.test(newPin)) {
+    return res.status(400).json({ error: 'PIN mới phải là 8 chữ số' });
+  }
+  users[discordId].pin = bcrypt.hashSync(newPin, 10);
+  saveUsers(users);
+  res.json({ success: true, message: 'Đổi PIN thành công' });
+});
+
+app.get('/auth/logout', (req, res) => {
+  const discordId = req.user?.discordId;
+  if (discordId) {
+    const users = readUsers();
+    if (users[discordId]?.token) cleanupClient(users[discordId].token);
+  }
+  req.logout(() => res.redirect('/'));
+});
+
+app.get('/dashboard', isAuthenticated, (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
+});
+
+// ---------------- API Selfbot ----------------
 app.get('/ping', (req, res) => res.send('ok'));
 
-// Kết nối token
-app.post('/api/connect', async (req, res) => {
+app.post('/api/save-token', isAuthenticated, (req, res) => {
+  const { token } = req.body;
+  const discordId = req.user.discordId;
+  if (!token) return res.status(400).json({ error: 'Token required' });
+  const users = readUsers();
+  if (users[discordId]) {
+    users[discordId].token = token;
+    saveUsers(users);
+  }
+  res.json({ success: true });
+});
+
+app.post('/api/connect', isAuthenticated, async (req, res) => {
   const { token } = req.body;
   if (!token) return res.status(400).json({ error: 'Token is required' });
 
-  // Nếu đã có client đang hoạt động, xóa trước
-  if (clients.has(token)) cleanupClient(token);
+  const users = readUsers();
+  const discordId = req.user.discordId;
+  if (users[discordId]) {
+    users[discordId].token = token;
+    saveUsers(users);
+  }
 
+  if (clients.has(token)) cleanupClient(token);
   const client = new Client({ checkUpdate: false });
   clients.set(token, client);
   setupClientEvents(client, token);
@@ -120,33 +269,22 @@ app.post('/api/connect', async (req, res) => {
     });
   } catch (err) {
     cleanupClient(token);
-    res.status(401).json({ error: 'Invalid token or login failed' });
+    res.status(401).json({ error: 'Token không hợp lệ hoặc đăng nhập thất bại' });
   }
 });
 
-// Ngắt kết nối token
-app.post('/api/disconnect', (req, res) => {
+app.post('/api/disconnect', isAuthenticated, (req, res) => {
   const { token } = req.body;
-  if (!token) return res.status(400).json({ error: 'Token is required' });
   cleanupClient(token);
   res.json({ success: true });
 });
 
-// Cập nhật Rich Presence
-app.post('/api/presence', async (req, res) => {
+app.post('/api/presence', isAuthenticated, async (req, res) => {
   const { token, ...data } = req.body;
   const client = clients.get(token);
   if (!client) return res.status(404).json({ error: 'Client not connected' });
 
-  const typeMap = {
-    PLAYING: 0,
-    STREAMING: 1,
-    LISTENING: 2,
-    WATCHING: 3,
-    COMPETING: 5,
-    CUSTOM: 4
-  };
-
+  const typeMap = { PLAYING: 0, STREAMING: 1, LISTENING: 2, WATCHING: 3, COMPETING: 5, CUSTOM: 4 };
   try {
     const activity = {
       type: typeMap[data.type?.toUpperCase()] || 0,
@@ -155,22 +293,14 @@ app.post('/api/presence', async (req, res) => {
     if (data.details) activity.details = data.details;
     if (data.state) activity.state = data.state;
     if (data.applicationId) activity.applicationId = data.applicationId;
-
-    // Assets
     activity.assets = {};
     if (data.largeImageKey) activity.assets.largeImage = data.largeImageKey;
     if (data.largeImageText) activity.assets.largeText = data.largeImageText;
     if (data.smallImageKey) activity.assets.smallImage = data.smallImageKey;
     if (data.smallImageText) activity.assets.smallText = data.smallImageText;
-
-    // Buttons
     activity.buttons = [];
-    if (data.button1Text && data.button1Url) {
-      activity.buttons.push({ label: data.button1Text, url: data.button1Url });
-    }
-    if (data.button2Text && data.button2Url) {
-      activity.buttons.push({ label: data.button2Text, url: data.button2Url });
-    }
+    if (data.button1Text && data.button1Url) activity.buttons.push({ label: data.button1Text, url: data.button1Url });
+    if (data.button2Text && data.button2Url) activity.buttons.push({ label: data.button2Text, url: data.button2Url });
 
     await client.user.setActivity(activity);
     res.json({ success: true });
@@ -179,13 +309,11 @@ app.post('/api/presence', async (req, res) => {
   }
 });
 
-// Voice: Join
-app.post('/api/voice/join', async (req, res) => {
+app.post('/api/voice/join', isAuthenticated, async (req, res) => {
   const { token, channelId, selfMute = false, selfDeaf = false } = req.body;
   const client = clients.get(token);
   if (!client) return res.status(404).json({ error: 'Client not connected' });
   if (!channelId) return res.status(400).json({ error: 'Channel ID required' });
-
   try {
     await joinVoiceChannel(client, token, channelId, selfMute, selfDeaf);
     res.json({ success: true });
@@ -194,16 +322,14 @@ app.post('/api/voice/join', async (req, res) => {
   }
 });
 
-// Voice: Leave
-app.post('/api/voice/leave', (req, res) => {
+app.post('/api/voice/leave', isAuthenticated, (req, res) => {
   const { token } = req.body;
   const client = clients.get(token);
   if (!client) return res.status(404).json({ error: 'Client not connected' });
-
   try {
     if (client.voice) client.voice.leave();
     const vs = voiceSettings.get(token);
-    if (vs && vs.reconnectTimeout) clearTimeout(vs.reconnectTimeout);
+    if (vs?.reconnectTimeout) clearTimeout(vs.reconnectTimeout);
     voiceSettings.delete(token);
     res.json({ success: true });
   } catch (err) {
@@ -211,21 +337,17 @@ app.post('/api/voice/leave', (req, res) => {
   }
 });
 
-// Lấy danh sách Quests
-app.get('/api/quests', async (req, res) => {
+app.get('/api/quests', isAuthenticated, async (req, res) => {
   const token = req.query.token;
   if (!token) return res.status(400).json({ error: 'Token required' });
-
   try {
-    const response = await axios.get('https://discord.com/api/v9/users/@me/quests', {
+    const resp = await axios.get('https://discord.com/api/v9/users/@me/quests', {
       headers: { Authorization: token }
     });
-    const quests = response.data.quests || [];
-    // Lọc những quest chưa nhận thưởng (userStatus != 'CLAIMED')
+    const quests = resp.data.quests || [];
     const available = quests.filter(q => q.userStatus !== 'CLAIMED').map(q => ({
       id: q.id,
-      name: q.config?.title || 'Unnamed Quest',
-      description: q.config?.description || '',
+      name: q.config?.title || 'Unnamed',
       gamePublisher: q.config?.gamePublisher || 'Unknown',
       questType: q.config?.questType || 'UNKNOWN',
       durationMinutes: q.config?.durationMinutes || 0,
@@ -234,31 +356,26 @@ app.get('/api/quests', async (req, res) => {
     }));
     res.json(available);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch quests' });
+    res.status(500).json({ error: 'Không lấy được quest' });
   }
 });
 
-// Bắt đầu auto quest
-app.post('/api/quests/start', async (req, res) => {
+app.post('/api/quests/start', isAuthenticated, async (req, res) => {
   const { token, questIds } = req.body;
   const client = clients.get(token);
   if (!client) return res.status(404).json({ error: 'Client not connected' });
-  if (!questIds || !questIds.length) return res.status(400).json({ error: 'No quest IDs' });
+  if (!questIds?.length) return res.status(400).json({ error: 'No quest IDs' });
 
-  // Hủy queue cũ nếu đang chạy
-  const oldQueue = questQueues.get(token);
-  if (oldQueue) oldQueue.abort = true;
-
+  const old = questQueues.get(token);
+  if (old) old.abort = true;
   const controller = { abort: false };
   questQueues.set(token, controller);
 
-  // Chạy bất đồng bộ
   const processQueue = async () => {
     for (const questId of questIds) {
       if (controller.abort) break;
       try {
-        // Fetch quest info để lấy duration & applicationId
-        const questRes = await axios.get(`https://discord.com/api/v9/users/@me/quests`, {
+        const questRes = await axios.get('https://discord.com/api/v9/users/@me/quests', {
           headers: { Authorization: token }
         });
         const quest = (questRes.data.quests || []).find(q => q.id === questId);
@@ -270,44 +387,28 @@ app.post('/api/quests/start', async (req, res) => {
         const durationMs = (quest.config?.durationMinutes || 5) * 60 * 1000;
         const appId = quest.config?.applicationId;
 
-        // Accept quest
         broadcastToToken(token, { event: 'questProgress', questId, percent: 0, status: 'accepted' });
         await axios.post(`https://discord.com/api/v9/users/@me/quests/${questId}/accept`, {}, {
           headers: { Authorization: token }
         });
 
-        // Set presence để giả lập đang chơi game
         if (appId) {
-          await client.user.setActivity({
-            type: 0, // PLAYING
-            name: quest.config.title || 'Quest Game',
-            applicationId: appId
-          });
+          await client.user.setActivity({ type: 0, name: quest.config.title || 'Quest', applicationId: appId });
         }
 
-        // Bắt đầu heartbeat loop
         const startTime = Date.now();
-        const heartbeatInterval = setInterval(async () => {
-          if (controller.abort) {
-            clearInterval(heartbeatInterval);
-            return;
-          }
+        const heartbeat = setInterval(async () => {
+          if (controller.abort) { clearInterval(heartbeat); return; }
           const elapsed = Date.now() - startTime;
           const percent = Math.min(100, Math.round((elapsed / durationMs) * 100));
           broadcastToToken(token, { event: 'questProgress', questId, percent, status: 'in_progress' });
-
-          // Gửi heartbeat
           try {
             await axios.post(`https://discord.com/api/v9/users/@me/quests/${questId}/heartbeat`, {
               stream_key: null
             }, { headers: { Authorization: token } });
-          } catch (e) {
-            console.error(`Heartbeat error: ${e.message}`);
-          }
-
-          // Khi đủ thời gian -> claim
+          } catch (e) {}
           if (elapsed >= durationMs) {
-            clearInterval(heartbeatInterval);
+            clearInterval(heartbeat);
             broadcastToToken(token, { event: 'questProgress', questId, percent: 100, status: 'claiming' });
             try {
               await axios.post(`https://discord.com/api/v9/users/@me/quests/${questId}/claim`, {}, {
@@ -318,30 +419,26 @@ app.post('/api/quests/start', async (req, res) => {
               broadcastToToken(token, { event: 'questProgress', questId, percent: 100, status: 'error', message: 'Claim failed' });
             }
           }
-        }, 30000); // heartbeat mỗi 30s
+        }, 30000);
 
-        // Đợi cho đến khi claim hoặc abort
         while (!controller.abort && questQueues.get(token) === controller) {
           await new Promise(resolve => setTimeout(resolve, 1000));
-          if (Date.now() - startTime >= durationMs + 5000) break; // đảm bảo thoát
+          if (Date.now() - startTime >= durationMs + 5000) break;
         }
-        clearInterval(heartbeatInterval);
-
+        clearInterval(heartbeat);
       } catch (err) {
         broadcastToToken(token, { event: 'questProgress', questId, percent: 0, status: 'error', message: err.message });
       }
     }
-    // Xóa controller nếu vẫn là của chúng ta
     if (questQueues.get(token) === controller) questQueues.delete(token);
     broadcastToToken(token, { event: 'questQueueDone' });
   };
 
   processQueue().catch(console.error);
-  res.json({ success: true, message: 'Quest queue started' });
+  res.json({ success: true, message: 'Bắt đầu xử lý quest' });
 });
 
-// Hủy quest queue
-app.post('/api/quests/stop', (req, res) => {
+app.post('/api/quests/stop', isAuthenticated, (req, res) => {
   const { token } = req.body;
   const controller = questQueues.get(token);
   if (controller) {
@@ -352,18 +449,13 @@ app.post('/api/quests/stop', (req, res) => {
   res.json({ success: true });
 });
 
-// ---------------- WebSocket Handling ----------------
+// ---------------- WebSocket ----------------
 wss.on('connection', (ws) => {
   let wsToken = null;
 
-  ws.on('message', (message) => {
+  ws.on('message', (msg) => {
     let data;
-    try {
-      data = JSON.parse(message);
-    } catch (e) {
-      return;
-    }
-
+    try { data = JSON.parse(msg); } catch (e) { return; }
     if (data.event === 'auth') {
       const token = data.token;
       if (clients.has(token)) {
@@ -371,9 +463,8 @@ wss.on('connection', (ws) => {
         if (!socketClients.has(token)) socketClients.set(token, new Set());
         socketClients.get(token).add(ws);
         ws.send(JSON.stringify({ event: 'auth', success: true }));
-        console.log(`[WS] Authenticated for ${token.slice(0, 10)}...`);
       } else {
-        ws.send(JSON.stringify({ event: 'auth', success: false, error: 'Token not connected' }));
+        ws.send(JSON.stringify({ event: 'auth', success: false, error: 'Token chưa được kết nối' }));
       }
     }
   });
@@ -388,7 +479,5 @@ wss.on('connection', (ws) => {
   ws.on('error', console.error);
 });
 
-// ---------------- Start Server ----------------
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+// ---------------- Start server ----------------
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
