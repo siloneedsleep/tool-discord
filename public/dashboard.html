@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dashboard - Discord Selfbot</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-white min-h-screen">
+  <div class="container mx-auto px-4 py-6 max-w-5xl">
+    <!-- Header -->
+    <div class="bg-gray-800 rounded-xl p-6 mb-6 flex justify-between items-center">
+      <h1 class="text-2xl font-bold">Dashboard</h1>
+      <div class="flex items-center gap-4">
+        <a href="/auth/logout" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded-lg">Đăng xuất</a>
+      </div>
+    </div>
+
+    <!-- Token -->
+    <div class="bg-gray-800 rounded-xl p-6 mb-6">
+      <label class="block text-sm mb-2">Discord User Token</label>
+      <div class="flex gap-2">
+        <input type="password" id="tokenInput" class="flex-1 bg-gray-700 rounded-lg px-4 py-2" placeholder="Nhập token...">
+        <button id="connectBtn" class="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded-lg">Kết nối</button>
+        <button id="disconnectBtn" class="bg-red-600 hover:bg-red-700 px-6 py-2 rounded-lg hidden">Ngắt</button>
+      </div>
+      <div id="userInfo" class="hidden mt-4 flex items-center gap-3">
+        <img id="avatar" class="w-10 h-10 rounded-full" src="">
+        <span id="username" class="font-semibold"></span>
+      </div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="flex border-b border-gray-700 mb-6">
+      <button class="tab-btn active px-4 py-2" data-tab="presence">Presence</button>
+      <button class="tab-btn px-4 py-2" data-tab="voice">Voice</button>
+      <button class="tab-btn px-4 py-2" data-tab="quests">Quests</button>
+    </div>
+
+    <!-- Tab Presence -->
+    <div id="presence-tab" class="tab-content">
+      <div class="bg-gray-800 rounded-xl p-6 shadow-lg">
+        <h2 class="text-xl font-bold mb-4">Tùy chỉnh Rich Presence</h2>
+        <form id="presenceForm" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label class="block text-sm mb-1">Activity Type</label>
+            <select id="type" class="w-full bg-gray-700 rounded p-2">
+              <option value="PLAYING">Playing</option>
+              <option value="STREAMING">Streaming</option>
+              <option value="LISTENING">Listening</option>
+              <option value="WATCHING">Watching</option>
+              <option value="COMPETING">Competing</option>
+              <option value="CUSTOM">Custom Status</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-sm mb-1">Name (Tên ứng dụng)</label>
+            <input type="text" id="name" class="w-full bg-gray-700 rounded p-2" placeholder="VD: League of Legends">
+          </div>
+          <div>
+            <label class="block text-sm mb-1">Details (Dòng 1)</label>
+            <input type="text" id="details" class="w-full bg-gray-700 rounded p-2">
+          </div>
+          <div>
+            <label class="block text-sm mb-1">State (Dòng 2)</label>
+            <input type="text" id="state" class="w-full bg-gray-700 rounded p-2">
+          </div>
+          <div>
+            <label class="block text-sm mb-1">Application ID (Tùy chọn)</label>
+            <input type="text" id="appId" class="w-full bg-gray-700 rounded p-2" placeholder="VD: 1234567890">
+          </div>
+          <div></div>
+          <div>
+            <label class="block text-sm mb-1">Large Image Key/URL</label>
+            <input type="text" id="largeImage" class="w-full bg-gray-700 rounded p-2">
+          </div>
+          <div>
+            <label class="block text-sm mb-1">Large Image Text</label>
+            <input type="text" id="largeImageText" class="w-full bg-gray-700 rounded p-2">
+          </div>
+          <div>
+            <label class="block text-sm mb-1">Small Image Key/URL</label>
+            <input type="text" id="smallImage" class="w-full bg-gray-700 rounded p-2">
+          </div>
+          <div>
+            <label class="block text-sm mb-1">Small Image Text</label>
+            <input type="text" id="smallImageText" class="w-full bg-gray-700 rounded p-2">
+          </div>
+          <div>
+            <label class="block text-sm mb-1">Button 1 Text</label>
+            <input type="text" id="btn1Text" class="w-full bg-gray-700 rounded p-2">
+          </div>
+          <div>
+            <label class="block text-sm mb-1">Button 1 URL</label>
+            <input type="text" id="btn1Url" class="w-full bg-gray-700 rounded p-2">
+          </div>
+          <div>
+            <label class="block text-sm mb-1">Button 2 Text</label>
+            <input type="text" id="btn2Text" class="w-full bg-gray-700 rounded p-2">
+          </div>
+          <div>
+            <label class="block text-sm mb-1">Button 2 URL</label>
+            <input type="text" id="btn2Url" class="w-full bg-gray-700 rounded p-2">
+          </div>
+        </form>
+        <button id="applyPresence" class="mt-4 bg-green-600 hover:bg-green-700 px-6 py-2 rounded-lg">Áp dụng Presence</button>
+        <span id="presenceStatus" class="ml-3 text-sm text-gray-300"></span>
+      </div>
+    </div>
+
+    <!-- Tab Voice -->
+    <div id="voice-tab" class="tab-content hidden">
+      <div class="bg-gray-800 rounded-xl p-6 shadow-lg">
+        <h2 class="text-xl font-bold mb-4">Treo Voice 24/7</h2>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+          <div>
+            <label class="block text-sm mb-1">Channel ID</label>
+            <input type="text" id="voiceChannelId" class="w-full bg-gray-700 rounded p-2" placeholder="ID kênh voice">
+          </div>
+          <div class="flex items-center gap-4">
+            <label class="flex items-center gap-2"><input type="checkbox" id="selfMute"> Self Mute</label>
+            <label class="flex items-center gap-2"><input type="checkbox" id="selfDeaf"> Self Deaf</label>
+          </div>
+        </div>
+        <div class="flex gap-3">
+          <button id="joinVoice" class="bg-green-600 hover:bg-green-700 px-6 py-2 rounded-lg">Vào phòng Voice</button>
+          <button id="leaveVoice" class="bg-red-600 hover:bg-red-700 px-6 py-2 rounded-lg">Rời phòng Voice</button>
+        </div>
+        <span id="voiceStatus" class="block mt-2 text-sm text-gray-300"></span>
+      </div>
+    </div>
+
+    <!-- Tab Quests -->
+    <div id="quests-tab" class="tab-content hidden">
+      <div class="bg-gray-800 rounded-xl p-6 shadow-lg">
+        <div class="flex justify-between items-center mb-4">
+          <h2 class="text-xl font-bold">Discord Quests</h2>
+          <div>
+            <button id="fetchQuests" class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg mr-2">Fetch Quests</button>
+            <button id="startQuests" class="bg-green-600 hover:bg-green-700 px-4 py-2 rounded-lg hidden">Bắt đầu làm Quest đã chọn</button>
+          </div>
+        </div>
+        <div id="questList" class="space-y-3 mb-4"></div>
+        <div id="questProgressContainer" class="space-y-2 hidden"></div>
+        <span id="questStatus" class="block text-sm text-gray-300"></span>
+      </div>
+    </div>
+  </div>
+
+  <script src="dashboard.js"></script>
+</body>
+</html>
