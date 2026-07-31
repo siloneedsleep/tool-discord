@@ -3,8 +3,7 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const session = require('express-session');
-const SqliteStore = require('better-sqlite3-session-store')(session);
-const Database = require('better-sqlite3');
+const SQLiteStore = require('connect-sqlite3')(session);
 const passport = require('passport');
 const DiscordStrategy = require('passport-discord').Strategy;
 const { Client } = require('discord.js-selfbot-v13');
@@ -46,9 +45,9 @@ function saveUsers(users) {
 app.use(express.json());
 app.use(express.static('public'));
 app.use(session({
-  store: new SqliteStore({
-    client: new Database(path.join(DATA_DIR, 'sessions.db')),
-    expired: { clear: true, intervalMs: 900000 }
+  store: new SQLiteStore({
+    db: 'sessions.db',
+    dir: DATA_DIR
   }),
   secret: SESSION_SECRET,
   resave: false,
