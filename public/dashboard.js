@@ -1,35 +1,39 @@
+// ==========================================
+// DASHBOARD.JS - Full (đã sửa auto load token)
+// ==========================================
+
 let token = '';
 let ws = null;
 
-// Lưu token vào server (gắn với user)
-async function saveTokenToServer(tok) {
-  await fetch('/api/save-token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ token: tok })
-  });
+// ========== Tự động load token đã lưu ==========
+async function loadSavedToken() {
+  try {
+    const res = await fetch('/api/get-saved-token');
+    const data = await res.json();
+    if (data.token) {
+      document.getElementById('tokenInput').value = data.token;
+      await connectWithToken(data.token);
+    }
+  } catch (e) {
+    console.log('Chưa có token lưu');
+  }
 }
 
-// WebSocket
-function connectWS() {
-  if (ws) ws.close();
-  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(`${protocol}//${location.host}`);
-  ws.onopen = () => {
-    if (token) ws.send(JSON.stringify({ event: 'auth', token }));
-  };
-  ws.onmessage = (event) => {
-    const data = JSON.parse(event.data);
-    if (data.event === 'questProgress') {
-      updateQuestProgress(data.questId, data.percent, data.status, data.message);
-    } else if (data.event === 'questQueueDone') {
-      document.getElementById('questStatus').textContent = 'Hoàn thành tất cả quest!';
-      document.getElementById('startQuests').classList.remove('hidden');
-    } else if (data.event === 'questQueueAborted') {
-      document.getElementById('questStatus').textContent = 'Hàng chờ quest đã bị hủy.';
-      document.getElementById('startQuests').classList.remove('hidden');
-    }
-  };
+// ========== Hàm kết nối dùng chung ==========
+async function connectWithToken(tok) {
+  token = tok;
+  const res = await fetch('/api/connect', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token })
+  });
+  const data = await res.json();
+  if (data.error) {
+    alert(data.error);
+    return;
+  }
+  updateUIForConnection(true, data);
+  connectWS();
 }
 
 // ========== UI Updates ==========
@@ -55,6 +59,28 @@ function updateUIForConnection(connected, user) {
   }
 }
 
+// ========== WebSocket ==========
+function connectWS() {
+  if (ws) ws.close();
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${protocol}//${location.host}`);
+  ws.onopen = () => {
+    if (token) ws.send(JSON.stringify({ event: 'auth', token }));
+  };
+  ws.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    if (data.event === 'questProgress') {
+      updateQuestProgress(data.questId, data.percent, data.status, data.message);
+    } else if (data.event === 'questQueueDone') {
+      document.getElementById('questStatus').textContent = 'Hoàn thành tất cả quest!';
+      document.getElementById('startQuests').classList.remove('hidden');
+    } else if (data.event === 'questQueueAborted') {
+      document.getElementById('questStatus').textContent = 'Hàng chờ quest đã bị hủy.';
+      document.getElementById('startQuests').classList.remove('hidden');
+    }
+  };
+}
+
 // ========== API Helper ==========
 async function apiRequest(url, method = 'GET', body = null) {
   const options = {
@@ -66,15 +92,11 @@ async function apiRequest(url, method = 'GET', body = null) {
   return res.json();
 }
 
-// ========== Kết nối token ==========
+// ========== Kết nối token (nút) ==========
 document.getElementById('connectBtn').addEventListener('click', async () => {
-  token = document.getElementById('tokenInput').value.trim();
-  if (!token) return alert('Nhập token');
-  const res = await apiRequest('/api/connect', 'POST', { token });
-  if (res.error) return alert(res.error);
-  updateUIForConnection(true, res);
-  saveTokenToServer(token);
-  connectWS();
+  const tok = document.getElementById('tokenInput').value.trim();
+  if (!tok) return alert('Nhập token');
+  await connectWithToken(tok);
 });
 
 // ========== Ngắt kết nối ==========
@@ -192,7 +214,6 @@ document.getElementById('startQuests').addEventListener('click', async () => {
   document.getElementById('questStatus').textContent = 'Hàng chờ đã bắt đầu...';
   document.getElementById('startQuests').classList.add('hidden');
   
-  // Tạo progress bars
   const progressContainer = document.getElementById('questProgressContainer');
   progressContainer.innerHTML = '';
   progressContainer.classList.remove('hidden');
@@ -232,7 +253,8 @@ function updateQuestProgress(questId, percent, status, message) {
   }
 }
 
-// Kết nối WebSocket khi load trang (nếu token đã lưu có thể thử kết nối)
+// ========== Khởi động ==========
 window.addEventListener('load', () => {
+  loadSavedToken();
   connectWS();
 });
