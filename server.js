@@ -218,7 +218,6 @@ app.post('/api/auth/verify-pin', (req, res) => {
     return res.status(401).json({ error: 'PIN không đúng' });
   }
 
-  // Cập nhật trạng thái PIN verified
   user.pinVerified = true;
   saveUsers(users);
 
@@ -243,6 +242,18 @@ app.get('/auth/logout', (req, res) => {
 
 app.get('/dashboard', isAuthenticated, (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
+});
+
+// Lấy token đã lưu
+app.get('/api/get-saved-token', isAuthenticated, (req, res) => {
+  const discordId = req.user.discordId;
+  const users = readUsers();
+  const user = users[discordId];
+  if (user && user.token) {
+    res.json({ token: user.token });
+  } else {
+    res.json({ token: null });
+  }
 });
 
 // ---------------- API Selfbot ----------------
