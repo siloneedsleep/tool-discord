@@ -59,22 +59,26 @@ passport.use(new DiscordStrategy({
   callbackURL: process.env.DISCORD_CALLBACK_URL || `${KEEP_ALIVE_URL}/auth/discord/callback`,
   scope: ['identify']
 }, (accessToken, refreshToken, profile, done) => {
-  process.nextTick(() => {
-    return done(null, {
-      id: profile.id,
-      username: profile.username,
-      avatar: profile.avatar,
-      discriminator: profile.discriminator,
-      accessToken: accessToken
-    });
+  return done(null, {
+    id: profile.id,
+    username: profile.username,
+    avatar: profile.avatar,
+    discriminator: profile.discriminator
   });
 }));
 
-passport.serializeUser((user, done) => done(null, user.id));
+passport.serializeUser((user, done) => {
+  done(null, user.id);
+});
+
 passport.deserializeUser((id, done) => {
   const users = readUsers();
-  const user = Object.values(users).find(u => u.discordId === id);
-  done(null, user || { id });
+  const user = users[id];
+  if (user) {
+    done(null, user);
+  } else {
+    done(null, { id });
+  }
 });
 
 // ---------------- Maps cho selfbot ----------------
@@ -142,7 +146,9 @@ function setupClientEvents(client, token) {
 
 // ---------------- Middleware kiểm tra đăng nhập + PIN ----------------
 function isAuthenticated(req, res, next) {
-  if (req.isAuthenticated() && req.user?.pinVerified) return next();
+  if (req.isAuthenticated() && req.user && req.user.pinVerified) {
+    return next();
+  }
   res.redirect('/');
 }
 
@@ -164,63 +170,75 @@ app.get('/auth/discord/callback',
 
 app.post('/api/auth/create-pin', (req, res) => {
   const { discordId, pin, username, avatar } = req.body;
+  
   if (!pin || !/^\d{8}$/.test(pin)) {
     return res.status(400).json({ error: 'PIN phải là 8 chữ số' });
   }
+
   const users = readUsers();
+  const hashedPin = bcrypt.hashSync(pin, 10);
+  
   users[discordId] = {
-    discordId,
-    username,
-    avatar,
-    pin: bcrypt.hashSync(pin, 10),
+    id: discordId,
+    discordId: discordId,
+    username: username,
+    avatar: avatar,
+    pin: hashedPin,
+    pinVerified: true,
     token: null,
     createdAt: new Date().toISOString()
   };
+  
   saveUsers(users);
-  req.login({ ...req.user, pinVerified: true, discordId }, (err) => {
-    if (err) return res.status(500).json({ error: 'Login failed' });
-    res.json({ success: true, redirect: '/dashboard' });
+  
+  req.login(users[discordId], (err) => {
+    if (err) {
+      console.error('Login error:', err);
+      return res.status(500).json({ error: 'Login failed' });
+    }
+    return res.json({ success: true, redirect: '/dashboard' });
   });
 });
 
 app.post('/api/auth/verify-pin', (req, res) => {
   const { discordId, pin } = req.body;
-  if (!discordId || !pin) return res.status(400).json({ error: 'Thiếu thông tin' });
+  
+  if (!discordId || !pin) {
+    return res.status(400).json({ error: 'Thiếu thông tin' });
+  }
+
   const users = readUsers();
   const user = users[discordId];
-  if (!user) return res.status(404).json({ error: 'Tài khoản không tồn tại' });
+  
+  if (!user) {
+    return res.status(404).json({ error: 'Tài khoản không tồn tại' });
+  }
+
   if (!bcrypt.compareSync(pin, user.pin)) {
     return res.status(401).json({ error: 'PIN không đúng' });
   }
-  req.login({ ...req.user, pinVerified: true, discordId }, (err) => {
-    if (err) return res.status(500).json({ error: 'Login failed' });
-    res.json({ success: true, redirect: '/dashboard' });
+
+  // Cập nhật trạng thái PIN verified
+  user.pinVerified = true;
+  saveUsers(users);
+
+  req.login(user, (err) => {
+    if (err) {
+      console.error('Login error:', err);
+      return res.status(500).json({ error: 'Login failed' });
+    }
+    return res.json({ success: true, redirect: '/dashboard' });
   });
 });
 
-app.post('/api/auth/change-pin', isAuthenticated, (req, res) => {
-  const { oldPin, newPin } = req.body;
-  const discordId = req.user.discordId;
-  const users = readUsers();
-  const user = users[discordId];
-  if (!bcrypt.compareSync(oldPin, user.pin)) {
-    return res.status(401).json({ error: 'PIN cũ không đúng' });
-  }
-  if (!/^\d{8}$/.test(newPin)) {
-    return res.status(400).json({ error: 'PIN mới phải là 8 chữ số' });
-  }
-  users[discordId].pin = bcrypt.hashSync(newPin, 10);
-  saveUsers(users);
-  res.json({ success: true, message: 'Đổi PIN thành công' });
-});
-
 app.get('/auth/logout', (req, res) => {
-  const discordId = req.user?.discordId;
-  if (discordId) {
-    const users = readUsers();
-    if (users[discordId]?.token) cleanupClient(users[discordId].token);
+  const user = req.user;
+  if (user && user.token) {
+    cleanupClient(user.token);
   }
-  req.logout(() => res.redirect('/'));
+  req.logout(() => {
+    res.redirect('/');
+  });
 });
 
 app.get('/dashboard', isAuthenticated, (req, res) => {
@@ -230,30 +248,20 @@ app.get('/dashboard', isAuthenticated, (req, res) => {
 // ---------------- API Selfbot ----------------
 app.get('/ping', (req, res) => res.send('ok'));
 
-app.post('/api/save-token', isAuthenticated, (req, res) => {
-  const { token } = req.body;
-  const discordId = req.user.discordId;
-  if (!token) return res.status(400).json({ error: 'Token required' });
-  const users = readUsers();
-  if (users[discordId]) {
-    users[discordId].token = token;
-    saveUsers(users);
-  }
-  res.json({ success: true });
-});
-
 app.post('/api/connect', isAuthenticated, async (req, res) => {
   const { token } = req.body;
   if (!token) return res.status(400).json({ error: 'Token is required' });
 
   const users = readUsers();
   const discordId = req.user.discordId;
+  
   if (users[discordId]) {
     users[discordId].token = token;
     saveUsers(users);
   }
 
   if (clients.has(token)) cleanupClient(token);
+  
   const client = new Client({ checkUpdate: false });
   clients.set(token, client);
   setupClientEvents(client, token);
@@ -275,6 +283,7 @@ app.post('/api/connect', isAuthenticated, async (req, res) => {
 
 app.post('/api/disconnect', isAuthenticated, (req, res) => {
   const { token } = req.body;
+  if (!token) return res.status(400).json({ error: 'Token is required' });
   cleanupClient(token);
   res.json({ success: true });
 });
@@ -285,6 +294,7 @@ app.post('/api/presence', isAuthenticated, async (req, res) => {
   if (!client) return res.status(404).json({ error: 'Client not connected' });
 
   const typeMap = { PLAYING: 0, STREAMING: 1, LISTENING: 2, WATCHING: 3, COMPETING: 5, CUSTOM: 4 };
+  
   try {
     const activity = {
       type: typeMap[data.type?.toUpperCase()] || 0,
@@ -293,14 +303,20 @@ app.post('/api/presence', isAuthenticated, async (req, res) => {
     if (data.details) activity.details = data.details;
     if (data.state) activity.state = data.state;
     if (data.applicationId) activity.applicationId = data.applicationId;
+    
     activity.assets = {};
     if (data.largeImageKey) activity.assets.largeImage = data.largeImageKey;
     if (data.largeImageText) activity.assets.largeText = data.largeImageText;
     if (data.smallImageKey) activity.assets.smallImage = data.smallImageKey;
     if (data.smallImageText) activity.assets.smallText = data.smallImageText;
+    
     activity.buttons = [];
-    if (data.button1Text && data.button1Url) activity.buttons.push({ label: data.button1Text, url: data.button1Url });
-    if (data.button2Text && data.button2Url) activity.buttons.push({ label: data.button2Text, url: data.button2Url });
+    if (data.button1Text && data.button1Url) {
+      activity.buttons.push({ label: data.button1Text, url: data.button1Url });
+    }
+    if (data.button2Text && data.button2Url) {
+      activity.buttons.push({ label: data.button2Text, url: data.button2Url });
+    }
 
     await client.user.setActivity(activity);
     res.json({ success: true });
@@ -314,6 +330,7 @@ app.post('/api/voice/join', isAuthenticated, async (req, res) => {
   const client = clients.get(token);
   if (!client) return res.status(404).json({ error: 'Client not connected' });
   if (!channelId) return res.status(400).json({ error: 'Channel ID required' });
+  
   try {
     await joinVoiceChannel(client, token, channelId, selfMute, selfDeaf);
     res.json({ success: true });
@@ -326,6 +343,7 @@ app.post('/api/voice/leave', isAuthenticated, (req, res) => {
   const { token } = req.body;
   const client = clients.get(token);
   if (!client) return res.status(404).json({ error: 'Client not connected' });
+  
   try {
     if (client.voice) client.voice.leave();
     const vs = voiceSettings.get(token);
@@ -340,6 +358,7 @@ app.post('/api/voice/leave', isAuthenticated, (req, res) => {
 app.get('/api/quests', isAuthenticated, async (req, res) => {
   const token = req.query.token;
   if (!token) return res.status(400).json({ error: 'Token required' });
+  
   try {
     const resp = await axios.get('https://discord.com/api/v9/users/@me/quests', {
       headers: { Authorization: token }
@@ -368,17 +387,20 @@ app.post('/api/quests/start', isAuthenticated, async (req, res) => {
 
   const old = questQueues.get(token);
   if (old) old.abort = true;
+  
   const controller = { abort: false };
   questQueues.set(token, controller);
 
   const processQueue = async () => {
     for (const questId of questIds) {
       if (controller.abort) break;
+      
       try {
         const questRes = await axios.get('https://discord.com/api/v9/users/@me/quests', {
           headers: { Authorization: token }
         });
         const quest = (questRes.data.quests || []).find(q => q.id === questId);
+        
         if (!quest) {
           broadcastToToken(token, { event: 'questProgress', questId, percent: 0, status: 'error', message: 'Quest not found' });
           continue;
@@ -388,6 +410,7 @@ app.post('/api/quests/start', isAuthenticated, async (req, res) => {
         const appId = quest.config?.applicationId;
 
         broadcastToToken(token, { event: 'questProgress', questId, percent: 0, status: 'accepted' });
+        
         await axios.post(`https://discord.com/api/v9/users/@me/quests/${questId}/accept`, {}, {
           headers: { Authorization: token }
         });
@@ -398,18 +421,25 @@ app.post('/api/quests/start', isAuthenticated, async (req, res) => {
 
         const startTime = Date.now();
         const heartbeat = setInterval(async () => {
-          if (controller.abort) { clearInterval(heartbeat); return; }
+          if (controller.abort) {
+            clearInterval(heartbeat);
+            return;
+          }
+          
           const elapsed = Date.now() - startTime;
           const percent = Math.min(100, Math.round((elapsed / durationMs) * 100));
           broadcastToToken(token, { event: 'questProgress', questId, percent, status: 'in_progress' });
+          
           try {
             await axios.post(`https://discord.com/api/v9/users/@me/quests/${questId}/heartbeat`, {
               stream_key: null
             }, { headers: { Authorization: token } });
           } catch (e) {}
+
           if (elapsed >= durationMs) {
             clearInterval(heartbeat);
             broadcastToToken(token, { event: 'questProgress', questId, percent: 100, status: 'claiming' });
+            
             try {
               await axios.post(`https://discord.com/api/v9/users/@me/quests/${questId}/claim`, {}, {
                 headers: { Authorization: token }
@@ -426,10 +456,12 @@ app.post('/api/quests/start', isAuthenticated, async (req, res) => {
           if (Date.now() - startTime >= durationMs + 5000) break;
         }
         clearInterval(heartbeat);
+        
       } catch (err) {
         broadcastToToken(token, { event: 'questProgress', questId, percent: 0, status: 'error', message: err.message });
       }
     }
+    
     if (questQueues.get(token) === controller) questQueues.delete(token);
     broadcastToToken(token, { event: 'questQueueDone' });
   };
@@ -456,6 +488,7 @@ wss.on('connection', (ws) => {
   ws.on('message', (msg) => {
     let data;
     try { data = JSON.parse(msg); } catch (e) { return; }
+    
     if (data.event === 'auth') {
       const token = data.token;
       if (clients.has(token)) {
