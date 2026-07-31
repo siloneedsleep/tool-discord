@@ -13,7 +13,6 @@
     "express": "^4.18.2",
     "express-session": "^1.18.0",
     "passport": "^0.7.0",
-    "passport-discord": "^1.0.0",
     "ws": "^8.16.0"
   },
   "engines": {
