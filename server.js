@@ -7,7 +7,6 @@ const passport = require('passport');
 const DiscordStrategy = require('passport-discord').Strategy;
 const { Client } = require('discord.js-selfbot-v13');
 const axios = require('axios');
-const bcrypt = require('bcryptjs');
 const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
@@ -16,7 +15,6 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// ---------------- Cấu hình ----------------
 const PORT = process.env.PORT || 3000;
 const KEEP_ALIVE_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
 const SESSION_SECRET = process.env.SESSION_SECRET || uuidv4();
@@ -27,20 +25,16 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 function readUsers() {
   try {
-    if (fs.existsSync(USERS_FILE)) {
-      return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
-    }
-  } catch (e) { console.error('Read users error:', e); }
+    if (fs.existsSync(USERS_FILE)) return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+  } catch (e) { console.error('Read error:', e); }
   return {};
 }
 
 function saveUsers(users) {
-  try {
-    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
-  } catch (e) { console.error('Save users error:', e); }
+  try { fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2)); } catch (e) {}
 }
 
-// ---------------- Express middleware ----------------
+// Middleware
 app.use(express.json());
 app.use(express.static('public'));
 app.use(session({
@@ -52,47 +46,38 @@ app.use(session({
 app.use(passport.initialize());
 app.use(passport.session());
 
-// ---------------- Passport Discord ----------------
+// Passport
 passport.use(new DiscordStrategy({
   clientID: process.env.DISCORD_CLIENT_ID,
   clientSecret: process.env.DISCORD_CLIENT_SECRET,
   callbackURL: process.env.DISCORD_CALLBACK_URL || `${KEEP_ALIVE_URL}/auth/discord/callback`,
-  scope: ['identify']
+  scope: ['identify', 'rpc', 'rpc.activities.write']
 }, (accessToken, refreshToken, profile, done) => {
   return done(null, {
     id: profile.id,
     username: profile.username,
     avatar: profile.avatar,
-    discriminator: profile.discriminator
+    discriminator: profile.discriminator,
+    accessToken: accessToken
   });
 }));
 
-passport.serializeUser((user, done) => {
-  done(null, user.id);
-});
-
+passport.serializeUser((user, done) => done(null, user.id));
 passport.deserializeUser((id, done) => {
   const users = readUsers();
-  const user = users[id];
-  if (user) {
-    done(null, user);
-  } else {
-    done(null, { id });
-  }
+  done(null, users[id] || { id });
 });
 
-// ---------------- Maps cho selfbot ----------------
+// Maps
 const clients = new Map();
 const socketClients = new Map();
 const voiceSettings = new Map();
 const questQueues = new Map();
 
-// ---------------- Keep-alive chống sleep Render ----------------
-setInterval(() => {
-  axios.get(`${KEEP_ALIVE_URL}/ping`).catch(() => {});
-}, 14 * 60 * 1000);
+// Keep-alive
+setInterval(() => { axios.get(`${KEEP_ALIVE_URL}/ping`).catch(() => {}); }, 14 * 60 * 1000);
 
-// ---------------- Helpers ----------------
+// Helpers
 function broadcastToToken(token, data) {
   const sockets = socketClients.get(token);
   if (sockets) {
@@ -117,7 +102,7 @@ async function joinVoiceChannel(client, token, channelId, selfMute, selfDeaf) {
     if (!client.voice) return;
     await client.voice.join(channelId, { selfMute, selfDeaf });
     voiceSettings.set(token, { channelId, selfMute, selfDeaf, reconnectTimeout: null });
-  } catch (err) { console.error('Voice join error:', err.message); }
+  } catch (err) { console.error('Voice error:', err.message); }
 }
 
 function setupClientEvents(client, token) {
@@ -144,190 +129,150 @@ function setupClientEvents(client, token) {
   client.on('error', (err) => console.error('Client error:', err.message));
 }
 
-// ---------------- Middleware kiểm tra đăng nhập + PIN ----------------
 function isAuthenticated(req, res, next) {
-  if (req.isAuthenticated() && req.user && req.user.pinVerified) {
-    return next();
-  }
+  if (req.isAuthenticated()) return next();
   res.redirect('/');
 }
 
-// ---------------- Auth routes ----------------
+// Auth Routes
 app.get('/auth/discord', passport.authenticate('discord'));
-
-app.get('/auth/discord/callback',
-  passport.authenticate('discord', { failureRedirect: '/' }),
-  (req, res) => {
-    const discordId = req.user.id;
-    const users = readUsers();
-    if (users[discordId]) {
-      res.redirect(`/?needPin=true&discordId=${discordId}`);
-    } else {
-      res.redirect(`/?createPin=true&discordId=${discordId}&username=${req.user.username}&avatar=${req.user.avatar}`);
-    }
-  }
-);
-
-app.post('/api/auth/create-pin', (req, res) => {
-  const { discordId, pin, username, avatar } = req.body;
-  
-  if (!pin || !/^\d{8}$/.test(pin)) {
-    return res.status(400).json({ error: 'PIN phải là 8 chữ số' });
-  }
-
+app.get('/auth/discord/callback', passport.authenticate('discord', { failureRedirect: '/' }), (req, res) => {
   const users = readUsers();
-  const hashedPin = bcrypt.hashSync(pin, 10);
-  
-  users[discordId] = {
-    id: discordId,
-    discordId: discordId,
-    username: username,
-    avatar: avatar,
-    pin: hashedPin,
-    pinVerified: true,
-    token: null,
-    createdAt: new Date().toISOString()
-  };
-  
-  saveUsers(users);
-  
-  req.login(users[discordId], (err) => {
-    if (err) {
-      console.error('Login error:', err);
-      return res.status(500).json({ error: 'Login failed' });
-    }
-    return res.json({ success: true, redirect: '/dashboard' });
-  });
-});
-
-app.post('/api/auth/verify-pin', (req, res) => {
-  const { discordId, pin } = req.body;
-  
-  if (!discordId || !pin) {
-    return res.status(400).json({ error: 'Thiếu thông tin' });
+  if (!users[req.user.id]) {
+    users[req.user.id] = {
+      id: req.user.id,
+      username: req.user.username,
+      avatar: req.user.avatar,
+      accessToken: req.user.accessToken,
+      userToken: null,
+      createdAt: new Date().toISOString()
+    };
+    saveUsers(users);
+  } else {
+    users[req.user.id].accessToken = req.user.accessToken;
+    saveUsers(users);
   }
-
-  const users = readUsers();
-  const user = users[discordId];
-  
-  if (!user) {
-    return res.status(404).json({ error: 'Tài khoản không tồn tại' });
-  }
-
-  if (!bcrypt.compareSync(pin, user.pin)) {
-    return res.status(401).json({ error: 'PIN không đúng' });
-  }
-
-  user.pinVerified = true;
-  saveUsers(users);
-
-  req.login(user, (err) => {
-    if (err) {
-      console.error('Login error:', err);
-      return res.status(500).json({ error: 'Login failed' });
-    }
-    return res.json({ success: true, redirect: '/dashboard' });
-  });
+  res.redirect('/dashboard');
 });
 
 app.get('/auth/logout', (req, res) => {
   const user = req.user;
-  if (user && user.token) {
-    cleanupClient(user.token);
-  }
-  req.logout(() => {
-    res.redirect('/');
-  });
+  if (user?.userToken) cleanupClient(user.userToken);
+  req.logout(() => res.redirect('/'));
 });
 
 app.get('/dashboard', isAuthenticated, (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
 });
 
-// Lấy token đã lưu
-app.get('/api/get-saved-token', isAuthenticated, (req, res) => {
-  const discordId = req.user.discordId;
+// API: Lấy thông tin user
+app.get('/api/user', isAuthenticated, (req, res) => {
   const users = readUsers();
-  const user = users[discordId];
-  if (user && user.token) {
-    res.json({ token: user.token });
-  } else {
-    res.json({ token: null });
-  }
+  const user = users[req.user.id];
+  res.json({
+    username: user?.username || req.user.username,
+    avatar: user?.avatar || req.user.avatar,
+    hasUserToken: !!user?.userToken,
+    isSafeMode: !user?.userToken
+  });
 });
 
-// ---------------- API Selfbot ----------------
-app.get('/ping', (req, res) => res.send('ok'));
-
-app.post('/api/connect', isAuthenticated, async (req, res) => {
+// API: Kết nối User Token (full power)
+app.post('/api/connect-usertoken', isAuthenticated, async (req, res) => {
   const { token } = req.body;
-  if (!token) return res.status(400).json({ error: 'Token is required' });
+  if (!token) return res.status(400).json({ error: 'Token required' });
 
   const users = readUsers();
-  const discordId = req.user.discordId;
-  
-  if (users[discordId]) {
-    users[discordId].token = token;
-    saveUsers(users);
-  }
-
-  if (clients.has(token)) cleanupClient(token);
-  
   const client = new Client({ checkUpdate: false });
-  clients.set(token, client);
-  setupClientEvents(client, token);
 
   try {
     await client.login(token);
     const user = client.user;
-    res.json({
-      id: user.id,
-      username: user.username,
-      discriminator: user.discriminator,
-      avatarURL: user.displayAvatarURL({ dynamic: true })
-    });
+
+    // Lưu token vào database
+    users[req.user.id].userToken = token;
+    saveUsers(users);
+
+    // Setup selfbot
+    clients.set(token, client);
+    setupClientEvents(client, token);
+
+    res.json({ success: true, username: user.username, avatarURL: user.displayAvatarURL({ dynamic: true }) });
   } catch (err) {
-    cleanupClient(token);
-    res.status(401).json({ error: 'Token không hợp lệ hoặc đăng nhập thất bại' });
+    try { client.destroy(); } catch(e) {}
+    res.status(401).json({ error: 'Token không hợp lệ' });
   }
 });
 
-app.post('/api/disconnect', isAuthenticated, (req, res) => {
-  const { token } = req.body;
-  if (!token) return res.status(400).json({ error: 'Token is required' });
-  cleanupClient(token);
+// API: Disconnect User Token
+app.post('/api/disconnect-usertoken', isAuthenticated, (req, res) => {
+  const users = readUsers();
+  const user = users[req.user.id];
+  if (user?.userToken) {
+    cleanupClient(user.userToken);
+    user.userToken = null;
+    saveUsers(users);
+  }
   res.json({ success: true });
 });
 
-app.post('/api/presence', isAuthenticated, async (req, res) => {
-  const { token, ...data } = req.body;
+// API: Presence an toàn (Access Token)
+app.post('/api/presence-safe', isAuthenticated, async (req, res) => {
+  const { type, name, details, state } = req.body;
+  const accessToken = req.user.accessToken;
+  const typeMap = { PLAYING: 0, STREAMING: 1, LISTENING: 2, WATCHING: 3, COMPETING: 5 };
+
+  try {
+    await axios.patch('https://discord.com/api/v9/users/@me/settings', {
+      custom_status: { text: state || '', emoji_name: null }
+    }, { headers: { Authorization: `Bearer ${accessToken}` } });
+
+    await axios.post('https://discord.com/api/v9/oauth2/applications/@me/rpc', {
+      cmd: 'SET_ACTIVITY',
+      args: {
+        pid: 1,
+        activity: {
+          type: typeMap[type?.toUpperCase()] || 0,
+          name: name || 'Unknown',
+          details: details || '',
+          state: state || ''
+        }
+      },
+      nonce: Date.now().toString()
+    }, { headers: { Authorization: `Bearer ${accessToken}` } });
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Không thể cập nhật presence' });
+  }
+});
+
+// API: Presence Full (User Token)
+app.post('/api/presence-full', isAuthenticated, async (req, res) => {
+  const { type, name, details, state, applicationId, largeImageKey, largeImageText, smallImageKey, smallImageText, button1Text, button1Url, button2Text, button2Url } = req.body;
+  const users = readUsers();
+  const token = users[req.user.id]?.userToken;
   const client = clients.get(token);
-  if (!client) return res.status(404).json({ error: 'Client not connected' });
+  if (!client) return res.status(404).json({ error: 'Chưa kết nối User Token' });
 
   const typeMap = { PLAYING: 0, STREAMING: 1, LISTENING: 2, WATCHING: 3, COMPETING: 5, CUSTOM: 4 };
-  
+
   try {
     const activity = {
-      type: typeMap[data.type?.toUpperCase()] || 0,
-      name: data.name || 'Unknown'
+      type: typeMap[type?.toUpperCase()] || 0,
+      name: name || 'Unknown'
     };
-    if (data.details) activity.details = data.details;
-    if (data.state) activity.state = data.state;
-    if (data.applicationId) activity.applicationId = data.applicationId;
-    
+    if (details) activity.details = details;
+    if (state) activity.state = state;
+    if (applicationId) activity.applicationId = applicationId;
     activity.assets = {};
-    if (data.largeImageKey) activity.assets.largeImage = data.largeImageKey;
-    if (data.largeImageText) activity.assets.largeText = data.largeImageText;
-    if (data.smallImageKey) activity.assets.smallImage = data.smallImageKey;
-    if (data.smallImageText) activity.assets.smallText = data.smallImageText;
-    
+    if (largeImageKey) activity.assets.largeImage = largeImageKey;
+    if (largeImageText) activity.assets.largeText = largeImageText;
+    if (smallImageKey) activity.assets.smallImage = smallImageKey;
+    if (smallImageText) activity.assets.smallText = smallImageText;
     activity.buttons = [];
-    if (data.button1Text && data.button1Url) {
-      activity.buttons.push({ label: data.button1Text, url: data.button1Url });
-    }
-    if (data.button2Text && data.button2Url) {
-      activity.buttons.push({ label: data.button2Text, url: data.button2Url });
-    }
+    if (button1Text && button1Url) activity.buttons.push({ label: button1Text, url: button1Url });
+    if (button2Text && button2Url) activity.buttons.push({ label: button2Text, url: button2Url });
 
     await client.user.setActivity(activity);
     res.json({ success: true });
@@ -336,12 +281,14 @@ app.post('/api/presence', isAuthenticated, async (req, res) => {
   }
 });
 
+// Voice (chỉ User Token)
 app.post('/api/voice/join', isAuthenticated, async (req, res) => {
-  const { token, channelId, selfMute = false, selfDeaf = false } = req.body;
+  const { channelId, selfMute = false, selfDeaf = false } = req.body;
+  const users = readUsers();
+  const token = users[req.user.id]?.userToken;
   const client = clients.get(token);
-  if (!client) return res.status(404).json({ error: 'Client not connected' });
-  if (!channelId) return res.status(400).json({ error: 'Channel ID required' });
-  
+  if (!client) return res.status(404).json({ error: 'Cần kết nối User Token' });
+
   try {
     await joinVoiceChannel(client, token, channelId, selfMute, selfDeaf);
     res.json({ success: true });
@@ -351,10 +298,11 @@ app.post('/api/voice/join', isAuthenticated, async (req, res) => {
 });
 
 app.post('/api/voice/leave', isAuthenticated, (req, res) => {
-  const { token } = req.body;
+  const users = readUsers();
+  const token = users[req.user.id]?.userToken;
   const client = clients.get(token);
-  if (!client) return res.status(404).json({ error: 'Client not connected' });
-  
+  if (!client) return res.status(404).json({ error: 'Cần kết nối User Token' });
+
   try {
     if (client.voice) client.voice.leave();
     const vs = voiceSettings.get(token);
@@ -366,10 +314,12 @@ app.post('/api/voice/leave', isAuthenticated, (req, res) => {
   }
 });
 
+// Quest (chỉ User Token)
 app.get('/api/quests', isAuthenticated, async (req, res) => {
-  const token = req.query.token;
-  if (!token) return res.status(400).json({ error: 'Token required' });
-  
+  const users = readUsers();
+  const token = users[req.user.id]?.userToken;
+  if (!token) return res.status(404).json({ error: 'Cần kết nối User Token' });
+
   try {
     const resp = await axios.get('https://discord.com/api/v9/users/@me/quests', {
       headers: { Authorization: token }
@@ -391,56 +341,51 @@ app.get('/api/quests', isAuthenticated, async (req, res) => {
 });
 
 app.post('/api/quests/start', isAuthenticated, async (req, res) => {
-  const { token, questIds } = req.body;
+  const users = readUsers();
+  const token = users[req.user.id]?.userToken;
   const client = clients.get(token);
-  if (!client) return res.status(404).json({ error: 'Client not connected' });
-  if (!questIds?.length) return res.status(400).json({ error: 'No quest IDs' });
+  if (!client) return res.status(404).json({ error: 'Cần kết nối User Token' });
+
+  const { questIds } = req.body;
+  if (!questIds?.length) return res.status(400).json({ error: 'Chưa chọn quest' });
 
   const old = questQueues.get(token);
   if (old) old.abort = true;
-  
+
   const controller = { abort: false };
   questQueues.set(token, controller);
 
   const processQueue = async () => {
     for (const questId of questIds) {
       if (controller.abort) break;
-      
       try {
         const questRes = await axios.get('https://discord.com/api/v9/users/@me/quests', {
           headers: { Authorization: token }
         });
         const quest = (questRes.data.quests || []).find(q => q.id === questId);
-        
         if (!quest) {
-          broadcastToToken(token, { event: 'questProgress', questId, percent: 0, status: 'error', message: 'Quest not found' });
+          broadcastToToken(token, { event: 'questProgress', questId, percent: 0, status: 'error' });
           continue;
         }
 
         const durationMs = (quest.config?.durationMinutes || 5) * 60 * 1000;
-        const appId = quest.config?.applicationId;
-
         broadcastToToken(token, { event: 'questProgress', questId, percent: 0, status: 'accepted' });
-        
+
         await axios.post(`https://discord.com/api/v9/users/@me/quests/${questId}/accept`, {}, {
           headers: { Authorization: token }
         });
 
-        if (appId) {
-          await client.user.setActivity({ type: 0, name: quest.config.title || 'Quest', applicationId: appId });
+        if (quest.config?.applicationId) {
+          await client.user.setActivity({ type: 0, name: quest.config.title || 'Quest', applicationId: quest.config.applicationId });
         }
 
         const startTime = Date.now();
         const heartbeat = setInterval(async () => {
-          if (controller.abort) {
-            clearInterval(heartbeat);
-            return;
-          }
-          
+          if (controller.abort) { clearInterval(heartbeat); return; }
           const elapsed = Date.now() - startTime;
           const percent = Math.min(100, Math.round((elapsed / durationMs) * 100));
           broadcastToToken(token, { event: 'questProgress', questId, percent, status: 'in_progress' });
-          
+
           try {
             await axios.post(`https://discord.com/api/v9/users/@me/quests/${questId}/heartbeat`, {
               stream_key: null
@@ -450,14 +395,13 @@ app.post('/api/quests/start', isAuthenticated, async (req, res) => {
           if (elapsed >= durationMs) {
             clearInterval(heartbeat);
             broadcastToToken(token, { event: 'questProgress', questId, percent: 100, status: 'claiming' });
-            
             try {
               await axios.post(`https://discord.com/api/v9/users/@me/quests/${questId}/claim`, {}, {
                 headers: { Authorization: token }
               });
               broadcastToToken(token, { event: 'questProgress', questId, percent: 100, status: 'completed' });
             } catch (claimErr) {
-              broadcastToToken(token, { event: 'questProgress', questId, percent: 100, status: 'error', message: 'Claim failed' });
+              broadcastToToken(token, { event: 'questProgress', questId, percent: 100, status: 'error' });
             }
           }
         }, 30000);
@@ -467,22 +411,21 @@ app.post('/api/quests/start', isAuthenticated, async (req, res) => {
           if (Date.now() - startTime >= durationMs + 5000) break;
         }
         clearInterval(heartbeat);
-        
       } catch (err) {
-        broadcastToToken(token, { event: 'questProgress', questId, percent: 0, status: 'error', message: err.message });
+        broadcastToToken(token, { event: 'questProgress', questId, percent: 0, status: 'error' });
       }
     }
-    
     if (questQueues.get(token) === controller) questQueues.delete(token);
     broadcastToToken(token, { event: 'questQueueDone' });
   };
 
   processQueue().catch(console.error);
-  res.json({ success: true, message: 'Bắt đầu xử lý quest' });
+  res.json({ success: true });
 });
 
 app.post('/api/quests/stop', isAuthenticated, (req, res) => {
-  const { token } = req.body;
+  const users = readUsers();
+  const token = users[req.user.id]?.userToken;
   const controller = questQueues.get(token);
   if (controller) {
     controller.abort = true;
@@ -492,14 +435,14 @@ app.post('/api/quests/stop', isAuthenticated, (req, res) => {
   res.json({ success: true });
 });
 
-// ---------------- WebSocket ----------------
+// WebSocket
 wss.on('connection', (ws) => {
   let wsToken = null;
 
   ws.on('message', (msg) => {
     let data;
     try { data = JSON.parse(msg); } catch (e) { return; }
-    
+
     if (data.event === 'auth') {
       const token = data.token;
       if (clients.has(token)) {
@@ -508,7 +451,7 @@ wss.on('connection', (ws) => {
         socketClients.get(token).add(ws);
         ws.send(JSON.stringify({ event: 'auth', success: true }));
       } else {
-        ws.send(JSON.stringify({ event: 'auth', success: false, error: 'Token chưa được kết nối' }));
+        ws.send(JSON.stringify({ event: 'auth', success: false }));
       }
     }
   });
@@ -519,9 +462,7 @@ wss.on('connection', (ws) => {
       if (socketClients.get(wsToken).size === 0) socketClients.delete(wsToken);
     }
   });
-
-  ws.on('error', console.error);
 });
 
-// ---------------- Start server ----------------
+app.get('/ping', (req, res) => res.send('ok'));
 server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
